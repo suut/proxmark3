@@ -27,6 +27,7 @@
 #include "cmdhf14a.h"
 #include "cmdhf14b.h"
 #include "cmdparser.h"
+#include "cmdtrace.h"
 #include "commonutil.h"
 #include "comms.h"
 #include "emv/emvcore.h"
@@ -54,6 +55,11 @@
 #define CALYPSO_MAX_ENCODED_SFI  0x1F
 #define CALYPSO_HCE_TOKEN_LEN    2
 #define CALYPSO_DUMP_FILENAME_MAX_SERIALS 8
+#define CALYPSO_MAX_EF_LIST_LIDS 128
+#define CALYPSO_MAX_LID_CANDIDATES 384
+#define CALYPSO_GET_DATA_INLINE_MAX 32
+#define CALYPSO_GET_DATA_HEX_BREAK 32
+#define CALYPSO_GET_DATA_HEX_INDENT "      "
 
 #define CALYPSO_MANUFACTURERS_RESOURCE "calypso/manufacturers"
 #define CALYPSO_IC_FAMILIES_RESOURCE   "calypso/ic_families"
@@ -81,6 +87,34 @@ typedef struct {
 } calypso_fci_t;
 
 typedef struct {
+    uint8_t key_versions[3];
+    uint8_t key_types[3];
+    uint8_t rfu;
+    uint16_t lid;
+} calypso_df_fcp_t;
+
+typedef struct {
+    uint8_t data_ref[2];
+    uint8_t rfu[5];
+    uint16_t lid;
+} calypso_ef_fcp_t;
+
+typedef struct {
+    uint8_t sfi;
+    uint8_t file_type;
+    uint8_t ef_type;
+    uint8_t record_size;
+    uint8_t num_records;
+    uint8_t access_conditions[4];
+    uint8_t key_indexes[4];
+    uint8_t status;
+    union {
+        calypso_df_fcp_t df;
+        calypso_ef_fcp_t ef;
+    } specific;
+} calypso_fcp_t;
+
+typedef struct {
     bool present;
     isodep_state_t protocol;
     bool has_14a;
@@ -92,6 +126,9 @@ typedef struct {
 typedef struct {
     uint8_t requested_aid[CALYPSO_MAX_AID_LEN];
     size_t requested_aid_len;
+    bool default_selection;
+    bool has_df_lid;
+    uint16_t df_lid;
     calypso_rf_info_t rf;
     uint8_t fci[APDU_RES_LEN];
     size_t fci_len;
@@ -133,6 +170,23 @@ typedef struct {
     size_t path_len;
 } calypso_file_ref_t;
 
+typedef enum {
+    CALYPSO_FILE_SOURCE_KNOWN = 0x01,
+    CALYPSO_FILE_SOURCE_EF_LIST = 0x02,
+} calypso_file_source_t;
+
+typedef struct {
+    calypso_file_ref_t ref;
+    uint8_t source;
+    char name_storage[16];
+} calypso_file_candidate_t;
+
+typedef struct {
+    uint16_t lids[CALYPSO_MAX_EF_LIST_LIDS];
+    size_t count;
+    bool truncated;
+} calypso_ef_list_t;
+
 typedef struct {
     uint16_t tag;
     const char *name;
@@ -154,6 +208,11 @@ static calypso_resource_t calypso_ic_families_resource = {CALYPSO_IC_FAMILIES_RE
 static calypso_resource_t calypso_operators_resource = {CALYPSO_OPERATORS_RESOURCE, NULL, false};
 
 static const char *calypso_json_lookup_name(calypso_resource_t *resource, uint32_t id);
+static void calypso_set_selected_result(bool is_implicitly_selected, const uint8_t *aid, size_t aid_len, bool has_df_lid, uint16_t df_lid, const calypso_rf_info_t *rf, const uint8_t *fci_data, size_t fci_len, uint16_t sw, const calypso_fci_t *fci, calypso_select_result_t *selected);
+static bool calypso_fcp_default_lid(const calypso_fcp_t *fcp, uint16_t *lid);
+static bool calypso_get_current_ef_lid(bool verbose, uint16_t *lid);
+static bool calypso_read_sw_has_data(uint16_t sw, size_t read_len);
+static int calypso_get_data_object(uint16_t tag, uint8_t *out, size_t out_len, size_t *read_len, uint16_t *sw);
 static void calypso_reselect_exact_df_name(const calypso_select_result_t *selected, bool verbose);
 static void calypso_print_rf_info(const calypso_rf_info_t *rf);
 
@@ -221,6 +280,15 @@ static const calypso_get_data_probe_t calypso_get_data_probes[] = {
     {0x0185, "Traceability Information", false},
     {0x5F52, "ATR historical bytes", true},
 };
+
+const char *CalypsoGetDataTagName(uint16_t tag) {
+    for (size_t i = 0; i < ARRAYLEN(calypso_get_data_probes); i++) {
+        if (calypso_get_data_probes[i].tag == tag) {
+            return calypso_get_data_probes[i].name;
+        }
+    }
+    return NULL;
+}
 
 static const char *calypso_file_structure_desc(uint8_t subtype) {
     switch (subtype) {
@@ -429,6 +497,43 @@ static bool calypso_parse_fci(const uint8_t *data, size_t data_len, calypso_fci_
 
     tlvdb_free(tlv);
     return fci->has_serial && fci->has_startup;
+}
+
+static bool calypso_parse_fcp(const uint8_t *data, size_t data_len, calypso_fcp_t *fcp) {
+    memset(fcp, 0, sizeof(*fcp));
+
+    struct tlvdb *tlv = tlvdb_parse_multi(data, data_len);
+    if (tlv == NULL) {
+        return false;
+    }
+
+    const struct tlv *calypso_file_header = tlvdb_get_tlv(tlvdb_find_full(tlv, 0x85));
+    if (calypso_file_header != NULL && calypso_file_header->len == 0x17) {
+        const uint8_t *value = calypso_file_header->value;
+        fcp->sfi = value[0];
+        fcp->file_type = value[1];
+        fcp->ef_type = value[2];
+        fcp->record_size = value[3];
+        fcp->num_records = value[4];
+        memcpy(fcp->access_conditions, &value[5], sizeof(fcp->access_conditions));
+        memcpy(fcp->key_indexes, &value[9], sizeof(fcp->key_indexes));
+        fcp->status = value[13];
+        if (fcp->file_type == 0x01 || fcp->file_type == 0x02) {
+            memcpy(fcp->specific.df.key_versions, &value[14], sizeof(fcp->specific.df.key_versions));
+            memcpy(fcp->specific.df.key_types, &value[17], sizeof(fcp->specific.df.key_types));
+            fcp->specific.df.rfu = value[20];
+            fcp->specific.df.lid = ((uint16_t)value[21] << 8) | value[22];
+        } else if (fcp->file_type == 0x04) {
+            memcpy(fcp->specific.ef.data_ref, &value[14], sizeof(fcp->specific.ef.data_ref));
+            memcpy(fcp->specific.ef.rfu, &value[16], sizeof(fcp->specific.ef.rfu));
+            fcp->specific.ef.lid = ((uint16_t)value[21] << 8) | value[22];
+        }
+        tlvdb_free(tlv);
+        return true;
+    }
+
+    tlvdb_free(tlv);
+    return false;
 }
 
 static const char *calypso_json_string_get(json_t *obj, const char *name) {
@@ -649,7 +754,7 @@ static void calypso_aid_attribution_init(const calypso_select_result_t *selected
         return;
     }
 
-    calypso_find_aid_match(attribution->root, selected->requested_aid, selected->requested_aid_len, "selected AID", &attribution->selected_match);
+    calypso_find_aid_match(attribution->root, selected->requested_aid, selected->requested_aid_len, selected->default_selection ? "default selection AID" : "selected AID", &attribution->selected_match);
     if (selected->parsed.has_df_name) {
         calypso_find_aid_match(attribution->root, selected->parsed.df_name, selected->parsed.df_name_len, "DF name", &attribution->df_name_match);
     }
@@ -744,11 +849,13 @@ static int calypso_select_attribution_score(json_t *root, const calypso_select_r
 static int calypso_select_aid(const uint8_t *aid, size_t aid_len, bool verbose, const calypso_rf_info_t *rf, calypso_select_result_t *selected, bool *matched) {
     *matched = false;
 
-    uint8_t response[APDU_RES_LEN] = {0};
-    size_t response_len = 0;
-    uint16_t sw = 0;
+    uint8_t select_response[APDU_RES_LEN] = {0};
+    size_t select_response_len = 0;
+    uint16_t select_sw = 0;
+    bool has_df_lid = false;
+    uint16_t df_lid = 0;
 
-    int res = Iso7816Select(CC_CONTACTLESS, false, true, (uint8_t *)aid, aid_len, response, sizeof(response), &response_len, &sw);
+    int res = Iso7816Select(CC_CONTACTLESS, false, true, (uint8_t *)aid, aid_len, select_response, sizeof(select_response), &select_response_len, &select_sw);
     if (res != PM3_SUCCESS) {
         if (verbose) {
             PrintAndLogEx(DEBUG, "Select AID %s failed: %d", sprint_hex_inrow(aid, aid_len), res);
@@ -756,34 +863,24 @@ static int calypso_select_aid(const uint8_t *aid, size_t aid_len, bool verbose, 
         return res;
     }
 
-    if (sw != ISO7816_OK && sw != 0x6283) {
+    if (select_sw != ISO7816_OK && select_sw != 0x6283) {
         if (verbose) {
-            PrintAndLogEx(DEBUG, "Select AID %s returned %04X - %s", sprint_hex_inrow(aid, aid_len), sw, GetAPDUCodeDescription(sw >> 8, sw & 0xFF));
+            PrintAndLogEx(DEBUG, "Select AID %s returned %04X - %s", sprint_hex_inrow(aid, aid_len), select_sw, GetAPDUCodeDescription(select_sw >> 8, select_sw & 0xFF));
         }
         return PM3_SUCCESS;
     }
 
     calypso_fci_t fci = {0};
-    if (calypso_parse_fci(response, response_len, &fci) == false) {
+    if (calypso_parse_fci(select_response, select_response_len, &fci) == false) {
         if (verbose) {
             PrintAndLogEx(DEBUG, "Select AID %s returned non-Calypso FCI", sprint_hex_inrow(aid, aid_len));
         }
         return PM3_SUCCESS;
     }
 
-    memset(selected, 0, sizeof(*selected));
-    memcpy(selected->requested_aid, aid, aid_len);
-    selected->requested_aid_len = aid_len;
-    if (rf != NULL) {
-        selected->rf = *rf;
-    }
-    if (selected->rf.present == false) {
-        selected->rf.protocol = GetISODEPState();
-    }
-    memcpy(selected->fci, response, response_len);
-    selected->fci_len = response_len;
-    selected->sw = sw;
-    selected->parsed = fci;
+    has_df_lid = calypso_get_current_ef_lid(verbose, &df_lid);
+
+    calypso_set_selected_result(false, aid, aid_len, has_df_lid, df_lid, rf, select_response, select_response_len, select_sw, &fci, selected);
 
     *matched = true;
     return PM3_SUCCESS;
@@ -1106,11 +1203,182 @@ static int calypso_get_data_object(uint16_t tag, uint8_t *out, size_t out_len, s
     return calypso_exchange_apdu(apdu, true, 0, out, out_len, read_len, sw);
 }
 
-static int calypso_unselect_file(uint16_t *sw) {
+static void calypso_set_selected_result(bool is_implicitly_selected, const uint8_t *aid, size_t aid_len, bool has_df_lid, uint16_t df_lid, const calypso_rf_info_t *rf, const uint8_t *fci_data, size_t fci_len, uint16_t sw, const calypso_fci_t *fci, calypso_select_result_t *selected) {
+    memset(selected, 0, sizeof(*selected));
+    if (aid != NULL && aid_len > 0) {
+        memcpy(selected->requested_aid, aid, aid_len);
+        selected->requested_aid_len = aid_len;
+    }
+    selected->default_selection = is_implicitly_selected;
+    selected->has_df_lid = has_df_lid;
+    selected->df_lid = df_lid;
+    if (rf != NULL) {
+        selected->rf = *rf;
+    }
+    if (selected->rf.present == false) {
+        selected->rf.protocol = GetISODEPState();
+    }
+    memcpy(selected->fci, fci_data, fci_len);
+    selected->fci_len = fci_len;
+    selected->sw = sw;
+    selected->parsed = *fci;
+}
+
+static bool calypso_selected_has_fci_info(const calypso_select_result_t *selected) {
+    if (selected == NULL) {
+        return false;
+    }
+
+    return selected->parsed.has_df_name || selected->parsed.has_serial || selected->parsed.has_startup;
+}
+
+static bool calypso_fcp_default_lid(const calypso_fcp_t *fcp, uint16_t *lid) {
+    if (fcp == NULL || lid == NULL) {
+        return false;
+    }
+
+    if (fcp->file_type == 0x01 || fcp->file_type == 0x02) {
+        *lid = fcp->specific.df.lid;
+        return *lid != 0x0000;
+    }
+
+    if (fcp->file_type == 0x04) {
+        *lid = fcp->specific.ef.lid;
+        return *lid != 0x0000;
+    }
+
+    return false;
+}
+
+static bool calypso_get_current_ef_lid(bool verbose, uint16_t *lid) {
     uint8_t response[APDU_RES_LEN] = {0};
     size_t response_len = 0;
-    sAPDU_t apdu = {0x00, ISO7816_SELECT_FILE, CALYPSO_SELECT_CURRENT_DF_P1, CALYPSO_SELECT_CURRENT_DF_P2, 0, NULL};
-    return calypso_exchange_apdu_with_cla_fallback(apdu, true, 0, response, sizeof(response), &response_len, sw);
+    uint16_t sw = 0;
+    int res = calypso_get_data_object(0x0062, response, sizeof(response), &response_len, &sw);
+    if (res != PM3_SUCCESS) {
+        if (verbose) {
+            PrintAndLogEx(DEBUG, "GET DATA 0062 exchange failed: %d", res);
+        }
+        return false;
+    }
+
+    calypso_fcp_t fcp = {0};
+    if (calypso_read_sw_has_data(sw, response_len) && calypso_parse_fcp(response, response_len, &fcp)) {
+        return calypso_fcp_default_lid(&fcp, lid);
+    }
+    if (verbose) {
+        PrintAndLogEx(DEBUG, "GET DATA 0062 did not return Calypso FCP (%04X - %s)", sw, GetAPDUCodeDescription(sw >> 8, sw & 0xFF));
+    }
+    return false;
+}
+
+static int calypso_select_current_df(bool include_file_id, uint8_t *response, size_t response_max, size_t *response_len, uint16_t *sw) {
+    uint8_t current_df_id[] = {0x00, 0x00};
+    sAPDU_t apdu = {
+        0x00,
+        ISO7816_SELECT_FILE,
+        CALYPSO_SELECT_CURRENT_DF_P1,
+        CALYPSO_SELECT_CURRENT_DF_P2,
+        include_file_id ? sizeof(current_df_id) : 0,
+        include_file_id ? current_df_id : NULL
+    };
+
+    return calypso_exchange_apdu_with_cla_fallback(apdu, true, 0, response, response_max, response_len, sw);
+}
+
+static int calypso_select_current_df_with_file_id_fallback(uint8_t *response, size_t response_max, size_t *response_len, uint16_t *sw) {
+    int res = calypso_select_current_df(false, response, response_max, response_len, sw);
+    if (res != PM3_SUCCESS || calypso_select_sw_has_file(*sw)) {
+        return res;
+    }
+
+    *response_len = 0;
+    *sw = 0;
+    return calypso_select_current_df(true, response, response_max, response_len, sw);
+}
+
+static int calypso_probe_current_df(const calypso_rf_info_t *rf, bool verbose, calypso_select_result_t *selected, bool *matched) {
+    *matched = false;
+
+    bool has_df_lid = false;
+    uint16_t df_lid = 0;
+    const uint8_t *fci_data = NULL;
+    size_t fci_len = 0;
+    uint16_t fci_sw = 0;
+    calypso_fci_t fci = {0};
+
+    uint8_t select_response[APDU_RES_LEN] = {0};
+    size_t select_response_len = 0;
+    uint16_t select_response_sw = 0;
+    int select_res = calypso_select_current_df_with_file_id_fallback(select_response, sizeof(select_response), &select_response_len, &select_response_sw);
+    if (select_res != PM3_SUCCESS) {
+        if (verbose) {
+            PrintAndLogEx(DEBUG, "Current DF SELECT exchange failed: %d", select_res);
+        }
+        return PM3_SUCCESS;
+    }
+    if (calypso_select_sw_has_file(select_response_sw) == false) {
+        if (verbose) {
+            PrintAndLogEx(DEBUG, "Current DF SELECT did not select a file (%04X - %s)", select_response_sw, GetAPDUCodeDescription(select_response_sw >> 8, select_response_sw & 0xFF));
+        }
+        return PM3_SUCCESS;
+    }
+
+    calypso_fci_t select_fci = {0};
+    if (calypso_parse_fci(select_response, select_response_len, &select_fci)) {
+        fci_data = select_response;
+        fci_len = select_response_len;
+        fci_sw = select_response_sw;
+        fci = select_fci;
+    } else {
+        calypso_fcp_t fcp = {0};
+        if (calypso_parse_fcp(select_response, select_response_len, &fcp)) {
+            has_df_lid = calypso_fcp_default_lid(&fcp, &df_lid);
+        }
+        if (verbose) {
+            PrintAndLogEx(DEBUG, "Current DF SELECT did not return Calypso FCI (%04X - %s)", select_response_sw, GetAPDUCodeDescription(select_response_sw >> 8, select_response_sw & 0xFF));
+        }
+    }
+
+    uint8_t aid[CALYPSO_MAX_AID_LEN] = {0};
+    size_t aid_len = 0;
+
+    uint8_t response[APDU_RES_LEN] = {0};
+    size_t response_len = 0;
+    uint16_t sw = 0;
+    int res = calypso_get_data_object(0x006F, response, sizeof(response), &response_len, &sw);
+    if (res != PM3_SUCCESS) {
+        if (verbose) {
+            PrintAndLogEx(DEBUG, "GET DATA 006F exchange failed: %d", res);
+        }
+    } else {
+        calypso_fci_t get_data_fci = {0};
+        if (calypso_read_sw_has_data(sw, response_len) && calypso_parse_fci(response, response_len, &get_data_fci)) {
+            fci_data = response;
+            fci_len = response_len;
+            fci_sw = sw;
+            fci = get_data_fci;
+        } else if (verbose) {
+            PrintAndLogEx(DEBUG, "GET DATA 006F did not return Calypso FCI (%04X - %s)", sw, GetAPDUCodeDescription(sw >> 8, sw & 0xFF));
+        }
+    }
+
+    uint16_t get_data_lid = 0;
+    if (calypso_get_current_ef_lid(verbose, &get_data_lid)) {
+        has_df_lid = true;
+        df_lid = get_data_lid;
+    }
+
+    if (fci_data != NULL) {
+        if (aid_len == 0 && fci.has_df_name && fci.df_name_len <= sizeof(aid)) {
+            memcpy(aid, fci.df_name, fci.df_name_len);
+            aid_len = fci.df_name_len;
+        }
+        calypso_set_selected_result(true, aid_len > 0 ? aid : NULL, aid_len, has_df_lid, df_lid, rf, fci_data, fci_len, fci_sw, &fci, selected);
+        *matched = true;
+    }
+
+    return PM3_SUCCESS;
 }
 
 static int calypso_read_sfi_record(uint8_t sfi, uint8_t record, uint16_t le, uint8_t *out, size_t out_len, size_t *read_len, uint16_t *sw) {
@@ -1174,8 +1442,10 @@ static int calypso_read_current_record(uint8_t record, uint16_t le, uint8_t *out
 }
 
 static int calypso_read_icc_file(uint8_t *icc, size_t icc_len, size_t *read_len, uint16_t *sw) {
-    uint16_t unselect_sw = 0;
-    calypso_unselect_file(&unselect_sw);
+    uint8_t response[APDU_RES_LEN] = {0};
+    size_t response_len = 0;
+    uint16_t current_df_sw = 0;
+    calypso_select_current_df_with_file_id_fallback(response, sizeof(response), &response_len, &current_df_sw);
 
     int res = calypso_select_file_by_id(CALYPSO_ICC_FILE_ID, sw);
     if (res != PM3_SUCCESS || calypso_select_sw_has_file(*sw) == false) {
@@ -1251,8 +1521,10 @@ static bool calypso_read_icc_from_master_file(const calypso_select_result_t *sel
 }
 
 static int calypso_read_ticketing_environment_file(uint8_t *env, size_t env_len, size_t *read_len, uint16_t *sw) {
-    uint16_t unselect_sw = 0;
-    calypso_unselect_file(&unselect_sw);
+    uint8_t response[APDU_RES_LEN] = {0};
+    size_t response_len = 0;
+    uint16_t current_df_sw = 0;
+    calypso_select_current_df_with_file_id_fallback(response, sizeof(response), &response_len, &current_df_sw);
 
     int res = calypso_select_file_by_id(CALYPSO_TICKET_DIR_ID, sw);
     if (res != PM3_SUCCESS || calypso_select_sw_has_file(*sw) == false) {
@@ -1286,22 +1558,6 @@ static int calypso_read_ticketing_environment(uint8_t *env, size_t env_len, size
     }
 
     return calypso_read_ticketing_environment_file(env, env_len, read_len, sw);
-}
-
-static void calypso_hex_nospace(const uint8_t *data, size_t data_len, char *out, size_t out_len) {
-    if (out_len == 0) {
-        return;
-    }
-
-    size_t pos = 0;
-    for (size_t i = 0; i < data_len && pos + 2 < out_len; i++) {
-        int written = snprintf(out + pos, out_len - pos, "%02X", data[i]);
-        if (written != 2) {
-            break;
-        }
-        pos += 2;
-    }
-    out[pos] = '\0';
 }
 
 static void calypso_dump_context_add_serial(calypso_dump_context_t *ctx, const calypso_select_result_t *selected) {
@@ -1347,9 +1603,7 @@ static void calypso_dump_default_filename(const calypso_select_result_t *selecte
                 serial_len -= CALYPSO_HCE_TOKEN_LEN;
             }
 
-            char serial[CALYPSO_SERIAL_LEN * 2 + 1] = {0};
-            calypso_hex_nospace(serial_data, serial_len, serial, sizeof(serial));
-            written = snprintf(serials + pos, sizeof(serials) - pos, "%s", serial);
+            written = snprintf(serials + pos, sizeof(serials) - pos, "%s", sprint_hex_inrow(serial_data, serial_len));
             if (written < 0 || (size_t)written >= sizeof(serials) - pos) {
                 break;
             }
@@ -1365,7 +1619,6 @@ static void calypso_dump_default_filename(const calypso_select_result_t *selecte
         return;
     }
 
-    char serial[CALYPSO_SERIAL_LEN * 2 + 1] = {0};
     const uint8_t *serial_data = selected->parsed.serial;
     size_t serial_len = CALYPSO_SERIAL_LEN;
     if (hce_filename) {
@@ -1373,14 +1626,11 @@ static void calypso_dump_default_filename(const calypso_select_result_t *selecte
         serial_len -= CALYPSO_HCE_TOKEN_LEN;
     }
 
-    calypso_hex_nospace(serial_data, serial_len, serial, sizeof(serial));
-    snprintf(filename, filename_len, "%s%s-dump", hce_filename ? "hf-calypso-hce-" : "hf-calypso-", serial);
+    snprintf(filename, filename_len, "%s%s-dump", hce_filename ? "hf-calypso-hce-" : "hf-calypso-", sprint_hex_inrow(serial_data, serial_len));
 }
 
 static void calypso_json_set_hex(json_t *obj, const char *key, const uint8_t *data, size_t data_len) {
-    char hex[APDU_RES_LEN * 2 + 1] = {0};
-    calypso_hex_nospace(data, data_len, hex, sizeof(hex));
-    json_object_set_new(obj, key, json_string(hex));
+    json_object_set_new(obj, key, json_string(sprint_hex_inrow(data, data_len)));
 }
 
 static void calypso_json_set_sw(json_t *obj, const char *key, uint16_t sw) {
@@ -1400,7 +1650,9 @@ static void calypso_json_add_select(json_t *root, const calypso_select_result_t 
     json_object_set_new(root, "type", json_string("calypso"));
     calypso_json_set_sw(root, "selectStatus", selected->sw);
     calypso_json_set_hex(root, "selectAid", selected->requested_aid, selected->requested_aid_len);
-    calypso_json_set_hex(root, "fci", selected->fci, selected->fci_len);
+    if (selected->fci_len > 0) {
+        calypso_json_set_hex(root, "fci", selected->fci, selected->fci_len);
+    }
     if (selected->parsed.has_df_name) {
         calypso_json_set_hex(root, "fciDfName", selected->parsed.df_name, selected->parsed.df_name_len);
     }
@@ -1423,7 +1675,128 @@ static void calypso_json_add_get_data(json_t *entries, const calypso_get_data_pr
     json_array_append_new(entries, entry);
 }
 
-static size_t calypso_probe_get_data_objects(json_t *entries, bool print_results, bool verbose) {
+static void calypso_ef_list_add_lid(calypso_ef_list_t *ef_list, uint16_t lid) {
+    if (ef_list == NULL) {
+        return;
+    }
+
+    for (size_t i = 0; i < ef_list->count; i++) {
+        if (ef_list->lids[i] == lid) {
+            return;
+        }
+    }
+
+    if (ef_list->count >= ARRAYLEN(ef_list->lids)) {
+        ef_list->truncated = true;
+        return;
+    }
+
+    ef_list->lids[ef_list->count++] = lid;
+}
+
+static void calypso_parse_ef_list_entries(const uint8_t *data, size_t data_len, calypso_ef_list_t *ef_list) {
+    const unsigned char *p = data;
+    size_t left = data_len;
+
+    while (left > 0) {
+        struct tlv entry = {0};
+        if (tlv_parse_tl(&p, &left, &entry) == false || entry.len > left) {
+            return;
+        }
+
+        if (entry.tag == 0xC1 && entry.len >= 2) {
+            uint16_t lid = ((uint16_t)p[0] << 8) | p[1];
+            calypso_ef_list_add_lid(ef_list, lid);
+        }
+
+        p += entry.len;
+        left -= entry.len;
+    }
+}
+
+static void calypso_parse_ef_list_object(const uint8_t *data, size_t data_len, calypso_ef_list_t *ef_list) {
+    const unsigned char *p = data;
+    size_t left = data_len;
+
+    while (left > 0) {
+        struct tlv tlv = {0};
+        if (tlv_parse_tl(&p, &left, &tlv) == false || tlv.len > left) {
+            return;
+        }
+
+        if (tlv.tag == 0xC0) {
+            calypso_parse_ef_list_entries(p, tlv.len, ef_list);
+        } else if (tlv.tag == 0xC1 && tlv.len >= 2) {
+            uint16_t lid = ((uint16_t)p[0] << 8) | p[1];
+            calypso_ef_list_add_lid(ef_list, lid);
+        }
+
+        p += tlv.len;
+        left -= tlv.len;
+    }
+}
+
+static bool calypso_ef_list_contains_lid(const calypso_ef_list_t *ef_list, uint16_t lid) {
+    if (ef_list == NULL) {
+        return false;
+    }
+
+    for (size_t i = 0; i < ef_list->count; i++) {
+        if (ef_list->lids[i] == lid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void calypso_print_get_data_object(const calypso_get_data_probe_t *probe, const uint8_t *data, size_t data_len) {
+    if (data_len <= CALYPSO_GET_DATA_INLINE_MAX) {
+        PrintAndLogEx(SUCCESS, " %04X %-24s : " _YELLOW_("%s"), probe->tag, probe->name, sprint_hex(data, data_len));
+        return;
+    }
+
+    PrintAndLogEx(SUCCESS, " %04X %-24s : " _YELLOW_("%zu bytes"), probe->tag, probe->name, data_len);
+    print_hex_noascii_break_ex(data, data_len, CALYPSO_GET_DATA_HEX_BREAK, CALYPSO_GET_DATA_HEX_INDENT "\x1b[33m", ' ', AEND);
+}
+
+static void calypso_print_info_data_objects(void) {
+    bool printed_header = false;
+
+    for (size_t i = 0; i < ARRAYLEN(calypso_get_data_probes); i++) {
+        const calypso_get_data_probe_t *probe = &calypso_get_data_probes[i];
+        if (probe->tag != 0x0185 && probe->tag != 0x5F52) {
+            continue;
+        }
+
+        uint8_t response[APDU_RES_LEN] = {0};
+        size_t response_len = 0;
+        uint16_t sw = 0;
+        int res = calypso_get_data_object(probe->tag, response, sizeof(response), &response_len, &sw);
+        bool has_data = res == PM3_SUCCESS && calypso_read_sw_has_data(sw, response_len);
+
+        if (printed_header == false && has_data) {
+            PrintAndLogEx(INFO, "");
+            PrintAndLogEx(INFO, "--- " _CYAN_("Get Data Objects") " ----------------------");
+            printed_header = true;
+        }
+
+        if (res != PM3_SUCCESS) {
+            continue;
+        }
+
+        if (sw == ISO7816_INS_NOT_SUPPORTED) {
+            break;
+        }
+
+        if (has_data == false) {
+            continue;
+        }
+
+        calypso_print_get_data_object(probe, response, response_len);
+    }
+}
+
+static size_t calypso_probe_get_data_objects(json_t *entries, bool print_results, bool verbose, calypso_ef_list_t *ef_list) {
     size_t found = 0;
 
     if (print_results || verbose) {
@@ -1445,15 +1818,25 @@ static size_t calypso_probe_get_data_objects(json_t *entries, bool print_results
             continue;
         }
 
+        if (sw == ISO7816_INS_NOT_SUPPORTED) {
+            if (verbose) {
+                PrintAndLogEx(INFO, " %04X %-24s : " _YELLOW_("%04X") " - %s", probe->tag, probe->name, sw, GetAPDUCodeDescription(sw >> 8, sw & 0xFF));
+            }
+            break;
+        }
+
         if (calypso_read_sw_has_data(sw, response_len)) {
             if (print_results || verbose) {
-                PrintAndLogEx(SUCCESS, " %04X %-24s : " _YELLOW_("%s"), probe->tag, probe->name, sprint_hex(response, response_len));
+                calypso_print_get_data_object(probe, response, response_len);
                 if (verbose && probe->tlv) {
                     TLVPrintFromBuffer(response, (int)response_len);
                 }
             }
             if (entries != NULL) {
                 calypso_json_add_get_data(entries, probe, response, response_len);
+            }
+            if (probe->tag == 0x00C0) {
+                calypso_parse_ef_list_object(response, response_len, ef_list);
             }
             found++;
             continue;
@@ -1491,6 +1874,129 @@ static void calypso_file_path_string(const calypso_file_ref_t *file, char *out, 
     }
 }
 
+static uint16_t calypso_file_ref_leaf_lid(const calypso_file_ref_t *file) {
+    if (file == NULL || file->path_len == 0) {
+        return 0;
+    }
+    return file->path[file->path_len - 1];
+}
+
+static bool calypso_file_ref_path_equals(const calypso_file_ref_t *file, const uint16_t *path, size_t path_len) {
+    if (file == NULL || path == NULL || file->path_len != path_len) {
+        return false;
+    }
+    return memcmp(file->path, path, path_len * sizeof(path[0])) == 0;
+}
+
+static bool calypso_lid_is_known(uint16_t lid) {
+    for (size_t i = 0; i < ARRAYLEN(calypso_file_refs); i++) {
+        if (calypso_file_ref_leaf_lid(&calypso_file_refs[i]) == lid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool calypso_lid_seen(const uint16_t *lids, size_t count, uint16_t lid) {
+    for (size_t i = 0; i < count; i++) {
+        if (lids[i] == lid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static calypso_file_candidate_t *calypso_find_file_candidate_by_path(calypso_file_candidate_t *candidates, size_t count, const uint16_t *path, size_t path_len) {
+    for (size_t i = 0; i < count; i++) {
+        if (calypso_file_ref_path_equals(&candidates[i].ref, path, path_len)) {
+            return &candidates[i];
+        }
+    }
+    return NULL;
+}
+
+static bool calypso_add_file_candidate(calypso_file_candidate_t *candidates, size_t capacity, size_t *count, const char *name, const uint16_t *path, size_t path_len, uint8_t source) {
+    if (candidates == NULL || count == NULL || path == NULL || path_len == 0 || path_len > CALYPSO_DUMP_PATH_MAX) {
+        return false;
+    }
+
+    calypso_file_candidate_t *existing = calypso_find_file_candidate_by_path(candidates, *count, path, path_len);
+    if (existing != NULL) {
+        existing->source |= source;
+        return true;
+    }
+
+    if (*count >= capacity) {
+        return false;
+    }
+
+    calypso_file_candidate_t *candidate = &candidates[*count];
+    memset(candidate, 0, sizeof(*candidate));
+    if (name == NULL) {
+        snprintf(candidate->name_storage, sizeof(candidate->name_storage), "EF_%04X", path[path_len - 1]);
+        candidate->ref.name = candidate->name_storage;
+    } else {
+        candidate->ref.name = name;
+    }
+    candidate->ref.sfi = -1;
+    memcpy(candidate->ref.path, path, path_len * sizeof(path[0]));
+    candidate->ref.path_len = path_len;
+    candidate->source = source;
+    (*count)++;
+    return true;
+}
+
+static size_t calypso_infer_lid_path(uint16_t lid, uint16_t *path) {
+    if (path == NULL) {
+        return 0;
+    }
+
+    uint16_t parent = lid & 0xFF00;
+    uint8_t high = (uint8_t)(lid >> 8);
+    if (parent != 0x0000 && high != 0x2F && high != 0x3F) {
+        path[0] = parent;
+        path[1] = lid;
+        return 2;
+    }
+
+    path[0] = lid;
+    return 1;
+}
+
+static size_t calypso_build_lid_file_candidates(const calypso_ef_list_t *ef_list, calypso_file_candidate_t *candidates, size_t capacity) {
+    size_t count = 0;
+
+    for (size_t i = 0; i < ARRAYLEN(calypso_file_refs); i++) {
+        uint8_t source = CALYPSO_FILE_SOURCE_KNOWN;
+        if (calypso_ef_list_contains_lid(ef_list, calypso_file_ref_leaf_lid(&calypso_file_refs[i]))) {
+            source |= CALYPSO_FILE_SOURCE_EF_LIST;
+        }
+        calypso_add_file_candidate(candidates, capacity, &count, calypso_file_refs[i].name, calypso_file_refs[i].path, calypso_file_refs[i].path_len, source);
+    }
+
+    if (ef_list == NULL) {
+        return count;
+    }
+
+    for (size_t i = 0; i < ef_list->count; i++) {
+        uint16_t lid = ef_list->lids[i];
+        if (calypso_lid_is_known(lid)) {
+            continue;
+        }
+
+        uint16_t inferred_path[CALYPSO_DUMP_PATH_MAX] = {0};
+        size_t inferred_path_len = calypso_infer_lid_path(lid, inferred_path);
+        calypso_add_file_candidate(candidates, capacity, &count, NULL, inferred_path, inferred_path_len, CALYPSO_FILE_SOURCE_EF_LIST);
+
+        uint16_t direct_path[CALYPSO_DUMP_PATH_MAX] = {lid};
+        if (inferred_path_len != 1 || inferred_path[0] != lid) {
+            calypso_add_file_candidate(candidates, capacity, &count, NULL, direct_path, 1, CALYPSO_FILE_SOURCE_EF_LIST);
+        }
+    }
+
+    return count;
+}
+
 static int calypso_read_binary_sfi(uint8_t sfi, uint8_t *out, size_t out_len, size_t *read_len, uint16_t *sw) {
     uint8_t response[APDU_RES_LEN] = {0};
     size_t response_len = 0;
@@ -1523,19 +2029,21 @@ static int calypso_read_current_binary(uint8_t *out, size_t out_len, size_t *rea
     return PM3_SUCCESS;
 }
 
-static int calypso_select_file_element(uint16_t file_id, uint8_t *fci, size_t fci_len, size_t *read_len, uint16_t *sw) {
+static int calypso_select_file_element(uint16_t file_id, uint8_t *fcp, size_t fcp_len, size_t *read_len, uint16_t *sw) {
     uint8_t response[APDU_RES_LEN] = {0};
     size_t response_len = 0;
     int res = calypso_select_file_id_with_p1_fallback(file_id, response, sizeof(response), &response_len, sw);
 
-    *read_len = MIN(response_len, fci_len);
-    memcpy(fci, response, *read_len);
+    *read_len = MIN(response_len, fcp_len);
+    memcpy(fcp, response, *read_len);
     return res;
 }
 
-static int calypso_select_file_path(const calypso_file_ref_t *file, uint8_t *fci, size_t fci_len, size_t *read_len, uint16_t *sw) {
-    uint16_t unselect_sw = 0;
-    calypso_unselect_file(&unselect_sw);
+static int calypso_select_file_path(const calypso_file_ref_t *file, uint8_t *fcp, size_t fcp_len, size_t *read_len, uint16_t *sw) {
+    uint8_t response[APDU_RES_LEN] = {0};
+    size_t response_len = 0;
+    uint16_t current_df_sw = 0;
+    calypso_select_current_df_with_file_id_fallback(response, sizeof(response), &response_len, &current_df_sw);
 
     size_t last_len = 0;
     uint16_t last_sw = 0;
@@ -1543,7 +2051,7 @@ static int calypso_select_file_path(const calypso_file_ref_t *file, uint8_t *fci
     for (size_t i = 0; i < file->path_len; i++) {
         last_len = 0;
         last_sw = 0;
-        res = calypso_select_file_element(file->path[i], fci, fci_len, &last_len, &last_sw);
+        res = calypso_select_file_element(file->path[i], fcp, fcp_len, &last_len, &last_sw);
         if (res != PM3_SUCCESS || calypso_select_sw_has_file(last_sw) == false) {
             break;
         }
@@ -1722,11 +2230,11 @@ static bool calypso_dump_sfi(uint8_t sfi, json_t *sfi_files, bool verbose, size_
     return true;
 }
 
-static bool calypso_dump_file_path(const calypso_file_ref_t *ref, json_t *files, bool verbose, size_t *file_count, size_t *record_count, int *first_error) {
-    uint8_t fci[APDU_RES_LEN] = {0};
-    size_t fci_len = 0;
+static bool calypso_dump_file_path(const calypso_file_ref_t *ref, uint8_t source, json_t *files, bool verbose, size_t *file_count, size_t *record_count, int *first_error) {
+    uint8_t fcp[APDU_RES_LEN] = {0};
+    size_t fcp_len = 0;
     uint16_t select_sw = 0;
-    int res = calypso_select_file_path(ref, fci, sizeof(fci), &fci_len, &select_sw);
+    int res = calypso_select_file_path(ref, fcp, sizeof(fcp), &fcp_len, &select_sw);
     if (res != PM3_SUCCESS) {
         if (first_error != NULL && *first_error == PM3_SUCCESS) {
             *first_error = res;
@@ -1760,17 +2268,23 @@ static bool calypso_dump_file_path(const calypso_file_ref_t *ref, json_t *files,
     calypso_file_path_string(ref, path, sizeof(path));
     json_object_set_new(file, "name", json_string(ref->name));
     json_object_set_new(file, "path", json_string(path));
-    if (fci_len > 0) {
-        calypso_json_set_hex(file, "fci", fci, fci_len);
+    if (fcp_len > 0) {
+        calypso_json_set_hex(file, "fcp", fcp, fcp_len);
     }
     if (calypso_read_sw_has_data(binary_sw, binary_len) && binary_len > 0) {
         calypso_json_set_hex(file, "binary", binary, binary_len);
     }
 
     PrintAndLogEx(INFO, "");
-    PrintAndLogEx(INFO, "--- " _CYAN_("%s") " (%s) --------------------", ref->name, path);
-    if (fci_len > 0) {
-        PrintAndLogEx(SUCCESS, "  fci              : " _YELLOW_("%s"), sprint_hex(fci, fci_len));
+    if ((source & CALYPSO_FILE_SOURCE_KNOWN) && (source & CALYPSO_FILE_SOURCE_EF_LIST)) {
+        PrintAndLogEx(INFO, "--- " _CYAN_("%s") " (%s) (known, ef list) --------------------", ref->name, path);
+    } else if (source & CALYPSO_FILE_SOURCE_EF_LIST) {
+        PrintAndLogEx(INFO, "--- " _CYAN_("%s") " (%s) (" _YELLOW_("ef list") ") --------------------", ref->name, path);
+    } else {
+        PrintAndLogEx(INFO, "--- " _CYAN_("%s") " (%s) (known) --------------------", ref->name, path);
+    }
+    if (fcp_len > 0) {
+        PrintAndLogEx(SUCCESS, "  fcp              : " _YELLOW_("%s"), sprint_hex(fcp, fcp_len));
     }
     if (calypso_read_sw_has_data(binary_sw, binary_len) && binary_len > 0) {
         PrintAndLogEx(SUCCESS, "  binary           : " _GREEN_("%s"), sprint_hex(binary, binary_len));
@@ -2001,12 +2515,27 @@ static void calypso_print_select_info(const calypso_select_result_t *selected, b
 
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "--- " _CYAN_("Calypso Information") " ---------------------");
-    calypso_print_hex_ascii_line(" SELECT AID        : ", selected->requested_aid, selected->requested_aid_len);
+    if (selected->requested_aid_len > 0) {
+        calypso_print_hex_ascii_line(selected->default_selection ? " Default AID       : " : " Selected AID      : ", selected->requested_aid, selected->requested_aid_len);
+    }
+    if (selected->has_df_lid) {
+        uint8_t lid[2] = {
+            (uint8_t)(selected->df_lid >> 8),
+            (uint8_t)(selected->df_lid & 0xFF)
+        };
+        PrintAndLogEx(SUCCESS, "%s" _GREEN_("%s"), selected->default_selection ? " Default DF LID    : " : " DF LID            : ", sprint_hex(lid, sizeof(lid)));
+    }
 
-    if (selected->parsed.has_df_name) {
-        calypso_print_hex_ascii_line(" FCI DF Name       : ", selected->parsed.df_name, selected->parsed.df_name_len);
+    if (selected->parsed.has_df_name && selected->default_selection == false) {
+        calypso_print_hex_ascii_line(" DF Name           : ", selected->parsed.df_name, selected->parsed.df_name_len);
     }
     calypso_print_aid_match_summary(aid_line_match);
+    calypso_print_aid_attribution_details(&attribution, verbose);
+
+    if (calypso_selected_has_fci_info(selected) == false) {
+        calypso_aid_attribution_free(&attribution);
+        return;
+    }
 
     bool hce = calypso_serial_is_hce(selected->parsed.serial);
     PrintAndLogEx(SUCCESS, " Serial number     : " _GREEN_("%s"), calypso_sprint_serial(selected->parsed.serial));
@@ -2019,8 +2548,6 @@ static void calypso_print_select_info(const calypso_select_result_t *selected, b
     }
 
     calypso_print_startup(selected->parsed.startup);
-
-    calypso_print_aid_attribution_details(&attribution, verbose);
 
     if (verbose) {
         PrintAndLogEx(INFO, "");
@@ -2079,7 +2606,8 @@ static int calypso_dump_selected_df(const calypso_select_result_t *selected, jso
     calypso_json_add_select(app, selected);
 
     json_t *get_data = json_array();
-    if (calypso_probe_get_data_objects(get_data, true, verbose) > 0) {
+    calypso_ef_list_t ef_list = {0};
+    if (calypso_probe_get_data_objects(get_data, true, verbose, &ef_list) > 0) {
         json_object_set_new(app, "dataObjects", get_data);
     } else {
         json_decref(get_data);
@@ -2113,15 +2641,28 @@ static int calypso_dump_selected_df(const calypso_select_result_t *selected, jso
     if (first_error == PM3_SUCCESS) {
         calypso_reselect_exact_df_name(selected, verbose);
         PrintAndLogEx(INFO, "");
-        PrintAndLogEx(INFO, "--- " _CYAN_("Search known file LID paths") " -------------");
-        for (size_t i = 0; i < ARRAYLEN(calypso_file_refs); i++) {
+        PrintAndLogEx(INFO, "--- " _CYAN_("Search known/discovered file LID paths") " --");
+
+        calypso_file_candidate_t candidates[CALYPSO_MAX_LID_CANDIDATES] = {0};
+        size_t candidate_count = calypso_build_lid_file_candidates(&ef_list, candidates, ARRAYLEN(candidates));
+        uint16_t dumped_lids[CALYPSO_MAX_LID_CANDIDATES] = {0};
+        size_t dumped_lid_count = 0;
+        for (size_t i = 0; i < candidate_count; i++) {
             if (kbd_enter_pressed()) {
                 PrintAndLogEx(WARNING, "Aborted by user");
                 first_error = PM3_EOPABORTED;
                 break;
             }
+            uint16_t leaf_lid = calypso_file_ref_leaf_lid(&candidates[i].ref);
+            if ((candidates[i].source & CALYPSO_FILE_SOURCE_EF_LIST) && calypso_lid_seen(dumped_lids, dumped_lid_count, leaf_lid)) {
+                continue;
+            }
             calypso_reselect_exact_df_name(selected, verbose);
-            calypso_dump_file_path(&calypso_file_refs[i], lid_files, verbose, &lid_file_count, &record_count, &first_error);
+            if (calypso_dump_file_path(&candidates[i].ref, candidates[i].source, lid_files, verbose, &lid_file_count, &record_count, &first_error)) {
+                if (dumped_lid_count < ARRAYLEN(dumped_lids) && calypso_lid_seen(dumped_lids, dumped_lid_count, leaf_lid) == false) {
+                    dumped_lids[dumped_lid_count++] = leaf_lid;
+                }
+            }
             if (first_error != PM3_SUCCESS) {
                 break;
             }
@@ -2367,6 +2908,10 @@ static int CmdHFCalypsoDump(const char *Cmd) {
     return first_error;
 }
 
+static int CmdHFCalypsoList(const char *Cmd) {
+    return CmdTraceListAlias(Cmd, "hf calypso", "calypso");
+}
+
 static int CmdHFCalypsoInfo(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf calypso info",
@@ -2411,7 +2956,10 @@ static int CmdHFCalypsoInfo(const char *Cmd) {
     if (user_aid_len > 0) {
         res = calypso_select_aid(user_aid, (size_t)user_aid_len, verbose, &rf, &selected, &matched);
     } else {
-        res = calypso_scan_aidlist(&rf, verbose, &selected, &matched);
+        res = calypso_probe_current_df(&rf, verbose, &selected, &matched);
+        if (res == PM3_SUCCESS && matched == false) {
+            res = calypso_scan_aidlist(&rf, verbose, &selected, &matched);
+        }
     }
 
     if (res != PM3_SUCCESS) {
@@ -2427,6 +2975,8 @@ static int CmdHFCalypsoInfo(const char *Cmd) {
     }
 
     calypso_print_select_info(&selected, verbose);
+    calypso_reselect_exact_df_name(&selected, verbose);
+    calypso_print_info_data_objects();
     calypso_reselect_exact_df_name(&selected, verbose);
 
     uint8_t icc[CALYPSO_ICC_RECORD_LEN] = {0};
@@ -2470,6 +3020,7 @@ static command_t CommandTable[] = {
     {"help", CmdHelp,          AlwaysAvailable, "This help"},
     {"info", CmdHFCalypsoInfo, IfPm3Iso14443,   "Tag information"},
     {"dump", CmdHFCalypsoDump, IfPm3Iso14443,   "Dump readable files and records"},
+    {"list", CmdHFCalypsoList, AlwaysAvailable, "List Calypso history"},
     {NULL, NULL, NULL, NULL}
 };
 

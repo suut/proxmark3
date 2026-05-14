@@ -462,7 +462,8 @@ ISO 7816-4 Basic interindustry commands. For command APDU's.
 #define PROTO_TEXKOM    19
 #define PROTO_XEROX     20
 #define PROTO_FMCOS20   21
-#define COUNT_OF_PROTOCOLS 22
+#define PROTO_CALYPSO   22
+#define COUNT_OF_PROTOCOLS 23
 
 // Picopass fuses
 #define FUSE_FPERS   0x80
@@ -609,9 +610,11 @@ ISO 7816-4 Basic interindustry commands. For command APDU's.
 #define MFDES_READ_RECORDS2              0xAB
 #define MFDES_READ_DATA2                 0xAD
 #define MFDES_ADDITIONAL_FRAME           0xAF
+#define MFDES_RESTORE_TRANSFER           0xB1
 #define MFDES_UPDATE_RECORD2             0xBA
 #define MFDES_READ_RECORDS               0xBB
 #define MFDES_READ_DATA                  0xBD
+#define MFDES_RESTRICT_MFC_UPDATE        0xBF
 #define MFDES_CREATE_CYCLIC_RECORD_FILE  0xC0
 #define MFDES_CREATE_LINEAR_RECORD_FILE  0xC1
 #define MFDES_CHANGE_KEY                 0xC4
@@ -624,6 +627,7 @@ ISO 7816-4 Basic interindustry commands. For command APDU's.
 #define MFDES_CREATE_VALUE_FILE          0xCC
 #define MFDES_CREATE_STD_DATA_FILE       0xCD
 #define MFDES_CREATE_TRANS_MAC_FILE      0xCE
+#define MFDES_CREATE_MFC_MAPPING         0xCF
 #define MFDES_DELETE_APPLICATION         0xDA
 #define MFDES_UPDATE_RECORD              0xDB
 #define MFDES_DEBIT                      0xDC
@@ -928,6 +932,7 @@ ISO 7816-4 Basic interindustry commands. For command APDU's.
 
 // Calypso protocol
 #define CALYPSO_GET_RESPONSE            0xC0
+#define CALYPSO_GET_DATA                0xCA
 #define CALYPSO_SELECT                  0xA4
 #define CALYPSO_INVALIDATE              0x04
 #define CALYPSO_REHABILITATE            0x44
@@ -935,7 +940,9 @@ ISO 7816-4 Basic interindustry commands. For command APDU's.
 #define CALYPSO_DECREASE                0x30
 #define CALYPSO_INCREASE                0x32
 #define CALYPSO_READ_BINARY             0xB0
+#define CALYPSO_READ_BINARY_EXTENDED    0xB1
 #define CALYPSO_READ_RECORD             0xB2
+#define CALYPSO_READ_RECORD_MULTIPLE    0xB3
 #define CALYPSO_UPDATE_BINARY           0xD6
 #define CALYPSO_UPDATE_RECORD           0xDC
 #define CALYPSO_WRITE_RECORD            0xD2

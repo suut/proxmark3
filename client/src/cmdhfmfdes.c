@@ -51,9 +51,6 @@
 #include "mifare/prime.h"
 #include "util.h"
 #include "crypto/originality.h"
-#include "x509_crt.h"
-#include "mbedtls/oid.h"
-#include "mbedtls/sha256.h"
 
 #define MAX_KEY_LEN        24
 #define MAX_KEYS_LIST_LEN  1024
@@ -88,8 +85,6 @@
 // LEAF Verified Open Application
 #define LEAF_VERIFIED_DEFAULT_AID       0xF51CD6U
 #define LEAF_VERIFIED_CERT_FILE         0x02
-#define LEAF_VERIFIED_MAX_CERT_LEN      4096
-#define LEAF_COMMUNITY_ROOT_KEY_PATH    "duox_trust/leaf_community/leaf_community-root-public-key.der"
 #define DUOX_VDE_DEFAULT_AID            0x1010F6U
 #define DUOX_VDE_CERT_FILE              0x00
 
@@ -6487,8 +6482,8 @@ static int CmdHF14ADesMakeMFCLicense(const char *Cmd) {
         arg_lit0("v", "verbose",                     "Show more output"),
         arg_str0("k",  "key", "<hex>",               "Key for computing the MAC, must be HEX 16(AES)"),
         arg_str0("b",  "blk", "<num>[,<num>[,...]]", "The MFC blocks to map, must be given in ascending order (use the special value 'all' for all blocks)"),
-        arg_lit0(NULL, "key-a",                      "Allow updating key A from inside sector trailers mapped to DESFire files"),
-        arg_lit0(NULL, "key-b",                      "Allow updating key B from inside sector trailers mapped to DESFire files"),
+        arg_lit0(NULL, "ka",                         "Allow updating key A from inside sector trailers mapped to DESFire files"),
+        arg_lit0(NULL, "kb",                         "Allow updating key B from inside sector trailers mapped to DESFire files"),
         arg_lit0(NULL, "restrict",                   "Allow the restriction of data updates by the MFC side"),
         arg_lit0(NULL, "map",                        "Allow mapping the blocks to DESFire files"),
         arg_lit0(NULL, "access-conditions",          "Allow updating the access conditions from inside sector trailers mapped to DESFire files"),
@@ -6522,7 +6517,7 @@ static int CmdHF14ADesMakeMFCLicense(const char *Cmd) {
     int mac_key_len = 0;
 
     if (key_arg->count != 1) {
-        PrintAndLogEx(ERR, "At most one instance of --key is required");
+        PrintAndLogEx(ERR, "Exactly one instance of --key is required");
         goto mfclicense_parsing_error;
     }
     if (CLIParamHexToBuf(key_arg, mac_key, sizeof (mac_key), &mac_key_len) != 0) {
@@ -6702,6 +6697,207 @@ static int CmdHF14ADesMakeMFCLicense(const char *Cmd) {
     return PM3_SUCCESS;
 
 mfclicense_parsing_error:
+    CLIParserFree(ctx);
+    return PM3_EINVARG;
+}
+
+static int CmdHF14ADesCreateMFCMapping(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfdes createmfcmapping",
+                  "Create a Mifare Classic mapping on a DESFire EV3C. The MFC License MAC key (AES only) must have been set previously as PICC key number 50.",
+                  "hf mfdes createmfcmapping --aid 123456 --fid 01 --mfc-keys FFFFFFFFFFFF111111111111222222222222 --mfc-blocks 4,5,6,8\n"
+                  "                    -> Map blocks 4, 5, 6, 8 where sector 1 key A is FFFFFFFFFFFF with key B readable,\n"
+                  "                    -> sector 2 keys are 111111111111 and 222222222222 with key B used for authentication\n");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("a",  "apdu",                            "Show APDU requests and responses"),
+        arg_lit0("v",  "verbose",                         "Verbose output"),
+        arg_int0("n",  "keyno", "<dec>",                  "Key number"),
+        arg_str0("t",  "algo", "<DES|2TDEA|3TDEA|AES>",   "Crypt algo"),
+        arg_str0("k",  "key", "<hex>",                    "Key for authenticate (HEX 8(DES), 16(2TDEA or AES) or 24(3TDEA) bytes)"),
+        arg_str0(NULL, "kdf", "<none|AN10922|gallagher>", "Key Derivation Function (KDF)"),
+        arg_str0("i",  "kdfi", "<hex>",                   "KDF input (1-31 hex bytes)"),
+        arg_str0("m",  "cmode", "<plain|mac|encrypt>",    "Communicaton mode"),
+        arg_str0("c",  "ccset", "<native|niso|iso>",      "Communicaton command set"),
+        arg_str0(NULL, "schann", "<d40|ev1|ev2|lrp>",     "Secure channel"),
+        arg_str0(NULL, "aid", "<hex>",                    "Application ID (3 hex bytes, big endian)"),
+        arg_str0(NULL, "isoid", "<hex>",                  "Application ISO ID (ISO DF ID) (2 hex bytes, big endian)"),
+        arg_str0(NULL, "fid", "<hex>",                    "File ID to map (1 hex byte)"),
+        arg_str0(NULL, "restore-fid", "<hex>",            "Restore source when mapping value files to value blocks (1 hex byte)"),
+        arg_str0("b",  "blk", "<num>[,<num>[,...]]",      "The MFC blocks to map, must be unique (use -b data for all data blocks, and -b trailer for all trailer blocks)"),
+        arg_str0(NULL, "mfc-license", "<hex>",            "The MFC license (omit to use saved license and license MAC)"),
+        arg_str0(NULL, "mfc-license-mac", "<hex>",        "The MFC license MAC (omit to use saved license and license MAC)"),
+        arg_lit0(NULL, "ka",                              "Allow updating key A from inside sector trailers mapped to DESFire files"),
+        arg_lit0(NULL, "kb",                              "Allow updating key B from inside sector trailers mapped to DESFire files"),
+        arg_lit0(NULL, "access-conditions",               "Allow updating the access conditions from inside sector trailers mapped to DESFire files"),
+        arg_lit0(NULL, "restore-transfer",                "Enable the RestoreTransfer command for the mapped value blocks"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    bool APDULogging = arg_get_lit(ctx, 1);
+    bool verbose = arg_get_lit(ctx, 2);
+    bool key_a = arg_get_lit(ctx, 18);
+    bool key_b = arg_get_lit(ctx, 19);
+    bool ac = arg_get_lit(ctx, 20);
+    bool restore_transfer = arg_get_lit(ctx, 21);
+
+    uint8_t license[192];
+    int license_len;
+    uint8_t license_mac[8];
+
+    bool use_saved_license;
+    struct arg_str *blk_str_arg = arg_get_str(ctx, 15);
+    struct arg_str *mfc_license_arg = arg_get_str(ctx, 16);
+    struct arg_str *mfc_license_mac_arg = arg_get_str(ctx, 17);
+
+    uint32_t restore_fid = -1;
+    uint32_t fid = -1;
+
+    if (!arg_get_u32_hexstr_def_nlen(ctx, 13, 0, &fid, 1, false)) {
+        PrintAndLogEx(ERR, "--fid is required");
+        goto createmfcmapping_parsing_error;
+    }
+    if (!arg_get_u32_hexstr_def_nlen(ctx, 14, 0, &restore_fid, 1, false)) {
+        if (restore_transfer) {
+            PrintAndLogEx(ERR, "--restore-fid is required");
+            goto createmfcmapping_parsing_error;
+        }
+    } else if (!restore_transfer) {
+        PrintAndLogEx(WARNING, "--restore-fid is ignored if --restore-transfer is not specified");
+    }
+
+    PrintAndLogEx(DEBUG, "FID: %02X", fid);
+    PrintAndLogEx(DEBUG, "Restore FID: %02X", restore_fid);
+
+    if (mfc_license_arg->count == 0 && mfc_license_mac_arg->count == 0) {
+        if (!saved_mfclicense_set || !saved_mfclicense_mac_set) {
+            PrintAndLogEx(ERR, "No saved license, create it with hf mfdes makemfclicense --save");
+            goto createmfcmapping_parsing_error;
+        }
+        use_saved_license = true;
+    } else if (mfc_license_arg->count == 1 && mfc_license_mac_arg->count == 1) {
+        use_saved_license = false;
+    } else {
+        PrintAndLogEx(ERR, "--mfc-license and --mfc-license-mac must be given together");
+        goto createmfcmapping_parsing_error;
+    }
+
+    if (use_saved_license) {
+        memcpy(license, saved_mfclicense, saved_mfclicense_len);
+        license_len = saved_mfclicense_len;
+        memcpy(license_mac, saved_mfclicense_mac, 8);
+    } else {
+        if (CLIParamHexToBuf(mfc_license_arg, license, sizeof (license), &license_len) != 0) {
+            goto createmfcmapping_parsing_error;
+        }
+        int license_mac_len = 0;
+        if (CLIParamHexToBuf(mfc_license_mac_arg, license_mac, 8, &license_mac_len) != 0) {
+            goto createmfcmapping_parsing_error;
+        }
+        if (license_mac_len != 8) {
+            PrintAndLogEx(ERR, "The license MAC must be 8 bytes");
+            goto createmfcmapping_parsing_error;
+        }
+    }
+
+    PrintAndLogEx(INFO, "License: %s", sprint_hex_inrow(license, license_len));
+    PrintAndLogEx(INFO, "MAC: %s", sprint_hex_inrow(license_mac, 8));
+
+    if (blk_str_arg->count != 1) {
+        PrintAndLogEx(ERR, "--blk is mandatory");
+        goto createmfcmapping_parsing_error;
+    }
+    // parse blocks
+    uint8_t blocks[64];
+    size_t num_blocks = 0;
+    if (strcmp(blk_str_arg->sval[0], "data") == 0) {
+        for (int i = 0; i < 64; i++) {
+            if (((i + 1) % 4) != 0) {
+                blocks[num_blocks++] = i;
+            }
+        }
+    } else if (strcmp(blk_str_arg->sval[0], "trailer") == 0) {
+        for (int i = 0; i < 64; i++) {
+            if (((i + 1) % 4) == 0) {
+                blocks[num_blocks++] = i;
+            }
+        }
+    } else if (parse_mfc_blocks(blk_str_arg->sval[0], blocks, &num_blocks, false) != PM3_SUCCESS) {
+        goto createmfcmapping_parsing_error;
+    }
+
+    bool trailer = ((blocks[0] + 1) % 4) == 0;
+
+    if (trailer && restore_transfer) {
+        PrintAndLogEx(ERR, "--restore-transfer not allowed on trailer blocks");
+        goto createmfcmapping_parsing_error;
+    } else if (!trailer && (key_a || key_b || ac)) {
+        PrintAndLogEx(ERR, "--key-a, --key-b, --access-conditions not allowed on data/value blocks");
+        goto createmfcmapping_parsing_error;
+    }
+
+    DesfireContext_t dctx = {0};
+    int securechann = 0;
+    uint32_t id = 0x000000;
+    DesfireISOSelectWay selectway = ISW6bAID;
+    int res = CmdDesGetSessionParameters(ctx, &dctx, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0, &securechann, DCMEncrypted, &id, &selectway);
+    if (res) {
+        CLIParserFree(ctx);
+        return res;
+    }
+
+    CLIParserFree(ctx);
+    SetAPDULogging(APDULogging);
+
+    uint8_t cmd_data[256];
+    size_t cmd_data_len = 0;
+
+    cmd_data[0] = fid & 0x1F;
+    cmd_data[1] = trailer ? 0x01 : 0x00;
+    if (key_a) {
+        cmd_data[1] |= 0x20;
+    }
+    if (key_b) {
+        cmd_data[1] |= 0x08;
+    }
+    if (restore_transfer) {
+        cmd_data[1] |= 0x04;
+    }
+    if (ac) {
+        cmd_data[1] |= 0x10;
+    }
+    cmd_data[2] = num_blocks;
+    cmd_data_len += 3;
+    memcpy(cmd_data + cmd_data_len, blocks, num_blocks);
+    cmd_data_len += num_blocks;
+
+    if (restore_transfer) {
+        cmd_data[cmd_data_len++] = restore_fid & 0x1F;
+    }
+
+    memcpy(cmd_data + cmd_data_len, license, license_len);
+    cmd_data_len += license_len;
+
+    memcpy(cmd_data + cmd_data_len, license_mac, 8);
+    cmd_data_len += 8;
+
+    res = DesfireSelectAndAuthenticateAppW(&dctx, securechann, selectway, id, false, verbose);
+    if (res != PM3_SUCCESS) {
+        DropField();
+        PrintAndLogEx(FAILED, "Select or authentication %s " _RED_("failed") ". Result [%d] %s", DesfireWayIDStr(selectway, id), res, DesfireAuthErrorToStr(res));
+        return res;
+    }
+
+    res = DesfireCreateMFCMapping(&dctx, cmd_data, cmd_data_len);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "Create MFC mapping " _RED_("failed") ". Result 0x%02X", res);
+    }
+    DropField();
+    return res;
+
+createmfcmapping_parsing_error:
     CLIParserFree(ctx);
     return PM3_EINVARG;
 }
@@ -8381,223 +8577,6 @@ static int CmdHF14ADesVdeSign(const char *Cmd) {
 }
 
 // Look up an attribute in a DN by OID. Returns pointer to mbedtls value buf or NULL.
-static const mbedtls_x509_buf *leaf_dn_find_oid(const mbedtls_x509_name *dn, const char *oid_buf, size_t oid_len) {
-    while (dn != NULL) {
-        if (dn->oid.len == oid_len && memcmp(dn->oid.p, oid_buf, oid_len) == 0)
-            return &dn->val;
-        dn = dn->next;
-    }
-    return NULL;
-}
-
-static int CmdHF14ADesLeaf(const char *Cmd) {
-    CLIParserContext *ctx;
-    CLIParserInit(&ctx, "hf mfdes leaf",
-                  "Read and verify a LEAF Verified credential on a MIFARE DUOX card.\n"
-                  "Selects the LEAF Verified Open Application, reads the X.509 certificate\n"
-                  "from file 0x02, verifies it was signed by the LEAF Root CA, performs ISO\n"
-                  "Internal Authenticate, and verifies the card signature with the public key\n"
-                  "embedded in the certificate.",
-                  "hf mfdes leaf                              -> verify with default AID D61CF5\n"
-                  "hf mfdes leaf -v                           -> verbose output\n"
-                  "hf mfdes leaf --aid D61CF5                 -> override AID\n"
-                  "hf mfdes leaf -d 00112233445566778899AABBCCDDEEFF -> explicit 16-byte challenge\n");
-
-    void *argtable[] = {
-        arg_param_begin,
-        arg_lit0("a",  "apdu",      "Show APDU requests and responses"),            // 1
-        arg_lit0("v",  "verbose",   "Verbose output"),                              // 2
-        arg_str0("d",  "challenge", "<hex>", "Challenge / RndA (16 bytes, random if omitted)"), // 3
-        arg_str0(NULL, "aid",       "<hex>", "Application ID (3 bytes, default D61CF5)"),       // 4
-        arg_int0("n",  "keynum",    "<dec>", "Key number (P2, default 0)"),                     // 5
-        arg_str0(NULL, "isoid",     "<hex>", "Application ISO ID / ISO DF FID (2 bytes)"),      // 6
-        arg_str0(NULL, "dfname",    "<hex>", "Application ISO DF Name (1-16 hex bytes)"),       // 7
-        arg_param_end
-    };
-    CLIExecWithReturn(ctx, Cmd, argtable, true);
-
-    bool APDULogging = arg_get_lit(ctx, 1);
-    bool verbose = arg_get_lit(ctx, 2);
-
-    uint8_t challenge[DUOX_INTAUTH_CHALLENGE_LEN] = {0};
-    int challenge_len = 0;
-    CLIGetHexWithReturn(ctx, 3, challenge, &challenge_len);
-    bool challenge_provided = (challenge_len > 0);
-    if (challenge_provided && challenge_len != DUOX_INTAUTH_CHALLENGE_LEN) {
-        PrintAndLogEx(ERR, "Challenge must be exactly 16 bytes, got %d", challenge_len);
-        CLIParserFree(ctx);
-        return PM3_EINVARG;
-    }
-
-    int keynum = arg_get_int_def(ctx, 5, 0);
-    if (keynum < 0 || keynum > 255) {
-        PrintAndLogEx(ERR, "Key number must be 0..255");
-        CLIParserFree(ctx);
-        return PM3_EINVARG;
-    }
-
-    mfd_app_select app_select = MfdSelectionInitAID(LEAF_VERIFIED_DEFAULT_AID);
-    if (MfdSelectionApplyCmdParameters(ctx, 4, 6, 7, &app_select) != PM3_SUCCESS) {
-        CLIParserFree(ctx);
-        return PM3_EINVARG;
-    }
-
-    SetAPDULogging(APDULogging);
-    CLIParserFree(ctx);
-
-    uint8_t leaf_root_pubkey[65] = {0};
-    int pk_res = ensure_ec_public_key(LEAF_COMMUNITY_ROOT_KEY_PATH, MBEDTLS_ECP_DP_SECP256R1, leaf_root_pubkey, sizeof(leaf_root_pubkey));
-    if (pk_res != PM3_SUCCESS) {
-        PrintAndLogEx(ERR, "Failed to load LEAF Root CA public key from " _YELLOW_("%s") " (%d)", LEAF_COMMUNITY_ROOT_KEY_PATH, pk_res);
-        return pk_res;
-    }
-
-    if (!challenge_provided) {
-        int res = pcrypto_rng_fill_oneshot(challenge, sizeof(challenge), "hf_mfdes_leaf");
-        if (res != PM3_SUCCESS) {
-            PrintAndLogEx(ERR, "Failed to generate random challenge");
-            return res;
-        }
-    }
-
-    PrintAndLogEx(INFO, "--- " _CYAN_("LEAF Verified Credential Check"));
-    if (verbose) {
-        MfdSelectionPrint(&app_select);
-    }
-
-    // Step 1: Select application
-    DesfireContext_t dctx = {0};
-    dctx.commMode = DCMPlain;
-    dctx.cmdSet = DCCNativeISO;
-
-    if (MfdSelectionSelectApplication(&dctx, &app_select, verbose) != PM3_SUCCESS) {
-        DropField();
-        return PM3_ESOFT;
-    }
-
-    // Step 2: Read X.509 certificate from file 0x02 (length=0 reads to EOF)
-    uint8_t cert_buf[LEAF_VERIFIED_MAX_CERT_LEN] = {0};
-    size_t cert_len = 0;
-    int res = DesfireReadFile(&dctx, LEAF_VERIFIED_CERT_FILE, 0, 0, cert_buf, &cert_len);
-    if (res != PM3_SUCCESS || cert_len == 0) {
-        PrintAndLogEx(ERR, "Read certificate file 0x%02X " _RED_("failed") " (%d)", LEAF_VERIFIED_CERT_FILE, res);
-        DropField();
-        return PM3_ESOFT;
-    }
-    PrintAndLogEx(SUCCESS, "Certificate read " _GREEN_("ok") " (%zu bytes)", cert_len);
-    if (verbose)
-        print_hex_break(cert_buf, cert_len, 32);
-
-    // Step 3: Parse certificate
-    mbedtls_x509_crt cert;
-    mbedtls_x509_crt_init(&cert);
-    int xres = mbedtls_x509_crt_parse_der(&cert, cert_buf, cert_len);
-    if (xres != 0) {
-        PrintAndLogEx(ERR, "X.509 parse " _RED_("failed") " (-0x%04x)", -xres);
-        mbedtls_x509_crt_free(&cert);
-        DropField();
-        return PM3_ESOFT;
-    }
-
-    // Print certificate details
-    PrintAndLogEx(INFO, "--- " _CYAN_("Certificate"));
-
-    char dnbuf[256] = {0};
-    mbedtls_x509_dn_gets(dnbuf, sizeof(dnbuf), &cert.subject);
-    PrintAndLogEx(INFO, "Subject...... " _YELLOW_("%s"), dnbuf);
-    mbedtls_x509_dn_gets(dnbuf, sizeof(dnbuf), &cert.issuer);
-    PrintAndLogEx(INFO, "Issuer....... " _YELLOW_("%s"), dnbuf);
-
-    char idbuf[128] = {0};
-    const mbedtls_x509_buf *open_id = leaf_dn_find_oid(&cert.subject,
-                                      MBEDTLS_OID_AT_SERIAL_NUMBER,
-                                      MBEDTLS_OID_SIZE(MBEDTLS_OID_AT_SERIAL_NUMBER));
-    if (open_id != NULL && open_id->len > 0) {
-        size_t cp = (open_id->len < sizeof(idbuf) - 1) ? open_id->len : sizeof(idbuf) - 1;
-        memcpy(idbuf, open_id->p, cp);
-        PrintAndLogEx(INFO, "Open ID...... " _YELLOW_("%s"), idbuf);
-    }
-
-    PrintAndLogEx(INFO, "Valid from... " _YELLOW_("%04d-%02d-%02d %02d:%02d:%02d"),
-                  cert.valid_from.year, cert.valid_from.mon, cert.valid_from.day,
-                  cert.valid_from.hour, cert.valid_from.min, cert.valid_from.sec);
-    PrintAndLogEx(INFO, "Valid to..... " _YELLOW_("%04d-%02d-%02d %02d:%02d:%02d"),
-                  cert.valid_to.year, cert.valid_to.mon, cert.valid_to.day,
-                  cert.valid_to.hour, cert.valid_to.min, cert.valid_to.sec);
-
-    if (cert.serial.len > 0)
-        PrintAndLogEx(INFO, "Serial....... " _YELLOW_("%s"), sprint_hex_inrow(cert.serial.p, cert.serial.len));
-
-    uint8_t fp[32] = {0};
-    if (mbedtls_sha256_ret(cert_buf, cert_len, fp, 0) == 0)
-        PrintAndLogEx(INFO, "SHA-256...... " _YELLOW_("%s"), sprint_hex_inrow(fp, sizeof(fp)));
-
-    // Step 4: Verify certificate signature against LEAF Root CA public key.
-    // The certificate uses ECDSA-SHA256 over secp256r1; ecdsa_signature_verify
-    // accepts the DER-encoded signature stored in cert.sig.
-    PrintAndLogEx(INFO, "--- " _CYAN_("Root CA Verification"));
-    bool root_ok = false;
-    int rres = ecdsa_signature_verify(
-                   MBEDTLS_ECP_DP_SECP256R1,
-                   leaf_root_pubkey,
-                   cert.tbs.p,
-                   (int)cert.tbs.len,
-                   cert.sig.p,
-                   cert.sig.len,
-                   true);
-    if (rres == PM3_SUCCESS) {
-        PrintAndLogEx(SUCCESS, "Root signature " _GREEN_("verified") " (LEAF Root CA P-256)");
-        root_ok = true;
-    } else {
-        PrintAndLogEx(ERR, "Root signature " _RED_("verification failed") " (%d)", rres);
-    }
-
-    // Extract card public key (P-256, uncompressed)
-    uint8_t card_pubkey[65] = {0};
-    int kres = ecdsa_public_key_from_pk(&cert.pk, MBEDTLS_ECP_DP_SECP256R1, card_pubkey, sizeof(card_pubkey));
-    mbedtls_x509_crt_free(&cert);
-    if (kres != 0) {
-        PrintAndLogEx(ERR, "Failed to extract card public key (-0x%04x)", -kres);
-        DropField();
-        return PM3_ESOFT;
-    }
-    if (verbose)
-        PrintAndLogEx(INFO, "Card pubkey.. %s", sprint_hex_inrow(card_pubkey, sizeof(card_pubkey)));
-
-    // Step 5: ISO Internal Authenticate
-    PrintAndLogEx(INFO, "--- " _CYAN_("ISO Internal Authenticate"));
-    PrintAndLogEx(INFO, "Challenge.... " _YELLOW_("%s"), sprint_hex_inrow(challenge, sizeof(challenge)));
-    uint8_t card_random[DUOX_INTAUTH_CHALLENGE_LEN] = {0};
-    uint8_t signature_rs[DUOX_INTAUTH_SIG_LEN] = {0};
-    res = duox_intauth_exchange(APDULogging, verbose, (uint8_t)keynum, challenge, card_random, signature_rs);
-    DropField();
-    if (res != PM3_SUCCESS)
-        return res;
-
-    // Step 6: Verify card signature with extracted public key.
-    PrintAndLogEx(INFO, "--- " _CYAN_("Signature Verification"));
-    bool card_ok = false;
-    int sig_res = duox_intauth_verify_sig(verbose, card_pubkey, challenge, card_random, signature_rs);
-    if (sig_res == PM3_SUCCESS) {
-        PrintAndLogEx(SUCCESS, "Card signature " _GREEN_("verified"));
-        card_ok = true;
-    } else {
-        PrintAndLogEx(ERR, "Card signature " _RED_("verification failed"));
-    }
-
-    PrintAndLogEx(NORMAL, "");
-    if (root_ok && card_ok) {
-        PrintAndLogEx(SUCCESS, "LEAF Verified credential " _GREEN_("AUTHENTIC"));
-        if (idbuf[0] != '\0')
-            PrintAndLogEx(SUCCESS, "Open ID...... " _GREEN_("%s"), idbuf);
-    } else {
-        PrintAndLogEx(ERR, "LEAF Verified credential " _RED_("FAILED") " (root=%s, card=%s)",
-                      root_ok ? "ok" : "fail", card_ok ? "ok" : "fail");
-    }
-
-    return (root_ok && card_ok) ? PM3_SUCCESS : PM3_ESOFT;
-}
-
 static const CLIParserOption mfdesValidateMethodOpts[] = {
     {MFDES_VALIDATE_METHOD_AUTO, "auto"},
     {MFDES_VALIDATE_METHOD_INTAUTH, "intauth"},
@@ -9652,11 +9631,11 @@ static command_t CommandTable[] = {
     {"value",            CmdHF14ADesValueOperations,  IfPm3Iso14443a,  "Operations with value file (get/credit/limited credit/debit/clear)"},
     {"clearrecfile",     CmdHF14ADesClearRecordFile,  IfPm3Iso14443a,  "Clear record File"},
     {"makemfclicense",   CmdHF14ADesMakeMFCLicense,   AlwaysAvailable, "Generate a Mifare Classic license for DESFire EV3C"},
+    {"createmfcmapping", CmdHF14ADesCreateMFCMapping, IfPm3Iso14443a,  "Create a Mifare Classic mapping on a DESFire EV3C"},
     {"-----------",      CmdHelp,                     IfPm3Iso14443a,  "----------------------- " _CYAN_("DUOX") " ------------------------"},
     {"verifycert",       CmdHF14ADesVerifyCert,       IfPm3Iso14443a,  "Validate cert from file and verify key possession"},
     {"intauth",          CmdHF14ADesIntAuth,          IfPm3Iso14443a,  "ISO Internal Authenticate (ECDSA challenge-response)"},
     {"vdesign",          CmdHF14ADesVdeSign,          IfPm3Iso14443a,  "VDE ECDSASign (EV charging signature over 32-byte challenge)"},
-    {"leaf",             CmdHF14ADesLeaf,             IfPm3Iso14443a,  "LEAF Verified credential read + cert + auth check"},
     {"-----------",      CmdHelp,                     IfPm3Iso14443a,  "----------------------- " _CYAN_("System") " -----------------------"},
     {"test",             CmdHF14ADesTest,             AlwaysAvailable, "Regression crypto tests"},
     {NULL, NULL, NULL, NULL}

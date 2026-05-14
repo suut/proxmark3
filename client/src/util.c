@@ -339,6 +339,38 @@ void print_hex_noascii_break(const uint8_t *data, const size_t len, uint8_t brea
     }
 }
 
+void print_hex_noascii_break_ex(const uint8_t *data, const size_t len, uint8_t breaks, const char *prefix, char separator, const char *suffix) {
+    if (data == NULL || len == 0 || breaks == 0) return;
+
+    if (prefix == NULL) {
+        prefix = "";
+    }
+    if (suffix == NULL) {
+        suffix = "";
+    }
+    char sep[2] = {separator, '\0'};
+
+    for (size_t pos = 0; pos < len; pos += breaks) {
+        char buf[UTIL_BUFFER_SIZE_SPRINT + 3] = {0};
+        size_t chunk_len = len - pos;
+        if (chunk_len > breaks) {
+            chunk_len = breaks;
+        }
+
+        char *p = buf;
+        size_t remaining = sizeof(buf);
+        for (size_t i = 0; i < chunk_len; i++) {
+            int written = snprintf(p, remaining, "%s%02X", (i > 0 && separator != '\0') ? sep : "", data[pos + i]);
+            if (written < 0 || (size_t)written >= remaining) {
+                break;
+            }
+            p += written;
+            remaining -= (size_t)written;
+        }
+        PrintAndLogEx(INFO, "%s%s%s", prefix, buf, suffix);
+    }
+}
+
 static void print_buffer_ex(const uint8_t *data, const size_t len, int level, uint8_t breaks) {
 
     // sanity checks
@@ -1943,4 +1975,76 @@ size_t unduplicate(uint8_t *d, size_t n, const uint8_t item_n) {
     }
 
     return write_index;
+}
+
+void str_trim_ascii_inplace(char *s) {
+    if (s == NULL) {
+        return;
+    }
+
+    size_t start = 0;
+    size_t len = strlen(s);
+    while (start < len && isspace((unsigned char)s[start])) {
+        start++;
+    }
+    while (len > start && isspace((unsigned char)s[len - 1])) {
+        len--;
+    }
+
+    if (start > 0) {
+        memmove(s, s + start, len - start);
+    }
+    s[len - start] = '\0';
+}
+
+void str_unescape_newlines_inplace(char *s) {
+    if (s == NULL) {
+        return;
+    }
+
+    size_t read_pos = 0;
+    size_t write_pos = 0;
+    size_t len = strlen(s);
+    while (read_pos < len) {
+        if (s[read_pos] == '\\' && (read_pos + 1) < len) {
+            char esc = s[read_pos + 1];
+            if (esc == 'n') {
+                s[write_pos++] = '\n';
+                read_pos += 2;
+                continue;
+            }
+            if (esc == 'r') {
+                s[write_pos++] = '\r';
+                read_pos += 2;
+                continue;
+            }
+            if (esc == 't') {
+                s[write_pos++] = '\t';
+                read_pos += 2;
+                continue;
+            }
+        }
+        s[write_pos++] = s[read_pos++];
+    }
+    s[write_pos] = '\0';
+}
+
+int str_copy_without_whitespace(const char *src, char *dst, size_t dst_size, size_t *dst_len) {
+    if (src == NULL || dst == NULL || dst_len == NULL || dst_size == 0) {
+        return PM3_EINVARG;
+    }
+
+    size_t out = 0;
+    for (size_t i = 0; src[i] != '\0'; i++) {
+        if (isspace((unsigned char)src[i])) {
+            continue;
+        }
+        if ((out + 1) >= dst_size) {
+            return PM3_EOVFLOW;
+        }
+        dst[out++] = src[i];
+    }
+    dst[out] = '\0';
+    *dst_len = out;
+    return PM3_SUCCESS;
 }

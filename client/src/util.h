@@ -84,6 +84,7 @@ void hex_to_buffer(uint8_t *buf, const uint8_t *hex_data, const size_t hex_len,
 void print_hex(const uint8_t *data, const size_t len);
 void print_hex_break(const uint8_t *data, const size_t len, const uint8_t breaks);
 void print_hex_noascii_break(const uint8_t *data, const size_t len, uint8_t breaks);
+void print_hex_noascii_break_ex(const uint8_t *data, const size_t len, uint8_t breaks, const char *prefix, char separator, const char *suffix);
 
 char *sprint_hex(const uint8_t *data, const size_t len);
 char *sprint_hex_inrow(const uint8_t *data, const size_t len);
@@ -214,5 +215,20 @@ void sb_append_char(smartbuf *sb, unsigned char c);
 uint8_t get_highest_frequency(const uint8_t *d, uint8_t n);
 
 size_t unduplicate(uint8_t *d, size_t n, const uint8_t item_n);
+
+/**
+ * @brief Trim leading and trailing ASCII whitespace from a mutable string.
+ */
+void str_trim_ascii_inplace(char *s);
+
+/**
+ * @brief Replace escaped \n, \r, and \t sequences with their control characters in-place.
+ */
+void str_unescape_newlines_inplace(char *s);
+
+/**
+ * @brief Copy a string while dropping all ASCII whitespace characters.
+ */
+int str_copy_without_whitespace(const char *src, char *dst, size_t dst_size, size_t *dst_len);
 
 #endif
